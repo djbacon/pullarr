@@ -1,0 +1,35 @@
+services:
+  pullarr:
+    build:
+      context: .
+      args:
+        APP_VERSION: 0.16.1
+    container_name: pullarr
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Europe/Riga
+      LOG_LEVEL: INFO
+      POLL_INTERVAL_SECONDS: 900
+      # yt-dlp updates automatically at startup and every 24 hours; failures retry hourly.
+      # Channel artwork and NFOs are automatic; use Plex NFO Series for local identities.
+      # Episode JPGs are saved automatically; enable Use local assets in Plex.
+      # Open pages clear browser caches and refresh after version changes (30-second checks).
+      # URLs stay clean (for example /#downloads); old refresh parameters are removed.
+      # Cache cleanup times out after 3 seconds so stalled browser APIs cannot block refresh.
+      # Click channel titles to browse uploads and queue selected older videos; no extra configuration.
+      # Skip Shorts is on by default; change it in Settings and click Save.
+      # Choose Original, x264 (SDR), or x265 (HDR) in Settings; applies to new downloads.
+      # Leftover staging files are cleaned automatically after the entire queue empties.
+      # Queue shows live download and conversion percentages automatically.
+      # One conversion can overlap the next download; no extra configuration.
+      # Conversion automatically uses the lowest CPU priority and idle disk I/O priority.
+      # Channels and Downloads menu counts update automatically; no extra configuration.
+      # Configure Plex notifications in Settings; use a reachable server URL.
+    # Keep both host folders unchanged during rebuilds: /config holds download history.
+    # Pending conversions resume from saved sources in /downloads/.pullarr-partial.
+    volumes:
+      - ./config:/config
+      # Settings uses the container path /downloads (or a subdirectory).
+      - /mnt/data/youtube:/downloads

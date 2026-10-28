@@ -1,0 +1,55 @@
+# Python bytecode, environments, and tool caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.fallow/
+.coverage
+htmlcov/
+
+# Local tests and generated test reports
+/tests/
+/test-results/
+/playwright-report/
+coverage.xml
+
+# Active deployment configuration and persistent user data
+/docker-compose.yml
+/docker-compose.yaml
+/compose.yml
+/compose.yaml
+/config/
+/downloads/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+.env
+.env.*
+
+# Local credentials and editor/agent state
+/.aws/
+/.agents/
+/.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary files and generated output
+/tmp/
+/temp/
+/build/
+/dist/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
