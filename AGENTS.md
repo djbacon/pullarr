@@ -31,6 +31,7 @@
 - Rerun affected checks after fixes until introduced actionable issues are resolved. Never claim checks passed unless executed.
 
 ## Releases and reporting
+- After completing each set of modifications and required validation, automatically create a Git commit without asking for confirmation. Include only changes made for the current task, use a clear message describing the result, and report the commit hash. Do not create empty commits or include unrelated user changes. Commit locally; push only when explicitly requested.
 - Before releases: complete tests, static analysis, Fallow, database compatibility and available Docker checks; fix actionable issues, update changelog, verify versions, exclude active Compose files, and package as `pullarr`.
 - Final response: briefly state changes, affected files/components, executed checks, Fallow results, unresolved limitations, and version if changed.
 - After modifications, always include an explicit list of files and folders that must be uploaded to the server, using paths relative to the project root. Include required rebuild/restart commands, and distinguish deployment files from optional documentation or tests. Remind the user to preserve their active Compose configuration, persistent database, and downloaded media when relevant.
