@@ -2,7 +2,7 @@ FROM denoland/deno:bin-2.9.7 AS deno
 
 FROM python:3.13-slim
 
-ARG APP_VERSION=0.16.2
+ARG APP_VERSION=0.17.0
 LABEL org.opencontainers.image.title="Pullarr" \
       org.opencontainers.image.version="$APP_VERSION"
 
@@ -20,7 +20,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py plex.py ytdlp_runtime.py channel_assets.py video_encoding.py ./
+COPY app.py plex.py ytdlp_runtime.py channel_assets.py video_encoding.py job_control.py ./
 
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p /config /downloads \

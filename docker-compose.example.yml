@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: 0.16.2
+        APP_VERSION: 0.17.0
     container_name: pullarr
     restart: unless-stopped
     ports:
@@ -24,6 +24,7 @@ services:
       # Choose Original, x264 (SDR), or x265 (HDR) in Settings; applies to new downloads.
       # Leftover staging files are cleaned automatically after the entire queue empties.
       # Queue shows live download and conversion percentages automatically.
+      # The trash button beside active progress cancels that job and ignores the video.
       # One conversion can overlap the next download; no extra configuration.
       # Conversion automatically uses the lowest CPU priority and idle disk I/O priority.
       # Channels and Downloads menu counts update automatically; no extra configuration.

@@ -10,6 +10,7 @@ import tempfile
 from fractions import Fraction
 from collections.abc import Callable
 from pathlib import Path
+import job_control
 
 MODES = ('original', 'x264', 'x265')
 SDR_FORMAT = 'bestvideo*[dynamic_range=SDR]+bestaudio/best[dynamic_range=SDR]'
@@ -26,13 +27,15 @@ def get_mode(conn: sqlite3.Connection) -> str:
     return validate_mode(row[0]) if row else 'original'
 
 
-def probe(path: Path) -> dict:
+def probe(path: Path, cancel=None) -> dict:
     try:
-        result = subprocess.run([
+        command = [
             'ffprobe', '-v', 'error', '-threads', '2', '-select_streams', 'v:0',
             '-read_intervals', '%+#64', '-show_streams', '-show_frames', '-show_format',
             '-of', 'json', str(path),
-        ], capture_output=True, text=True, timeout=60, check=True)
+        ]
+        result = (cancel.run(command, timeout=60) if cancel is not None else
+                  subprocess.run(command, capture_output=True, text=True, timeout=60, check=True))
         data = json.loads(result.stdout)
         stream = data['streams'][0]
         stream['format_duration'] = data.get('format', {}).get('duration')
@@ -119,9 +122,11 @@ def encoding_percent(line: str, duration: float | None) -> float | None:
 
 
 def encode(source: Path, destination: Path, mode: str,
-           progress: Callable[[float | None], None] | None = None) -> None:
+           progress: Callable[[float | None], None] | None = None, cancel=None) -> None:
     """Never replace existing media; keep staged input until validated output is published."""
-    stream = probe(source)
+    stream = probe(source, cancel=cancel)
+    cancel = cancel or job_control.Cancellation()
+    cancel.check()
     args = encoder_args(mode, stream)
     duration = source_duration(stream)
     if progress is not None:
@@ -133,7 +138,7 @@ def encode(source: Path, destination: Path, mode: str,
         output = Path(work) / 'video.mkv'
         # A file-backed log bounds memory even for long encodes.
         with tempfile.TemporaryFile() as errors:
-            with subprocess.Popen([
+            with cancel.process([
                 *conversion_priority(), 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-n',
                 '-progress', 'pipe:1', '-nostats', '-threads', '2', '-i', str(source),
                 '-map', '0:v:0', '-map', '0:a?', '-map_metadata', '0', *args,
@@ -148,7 +153,8 @@ def encode(source: Path, destination: Path, mode: str,
                 errors.seek(0, os.SEEK_END)
                 errors.seek(max(0, errors.tell() - 4000))
                 raise RuntimeError('Video conversion failed: ' + errors.read().decode(errors='replace'))
-        encoded = probe(output)
+        encoded = probe(output, cancel=cancel)
+        cancel.check()
         expected = 'h264' if mode == 'x264' else 'hevc'
         if not output.stat().st_size or encoded.get('codec_name') != expected:
             raise RuntimeError('Encoded video failed codec validation')
@@ -165,12 +171,16 @@ def ready_path(source: Path, mode: str) -> Path:
 
 
 def convert(source: Path, destination: Path, mode: str,
-            progress: Callable[[float | None], None] | None = None) -> Path:
+            progress: Callable[[float | None], None] | None = None, cancel=None) -> Path:
+    if cancel is not None:
+        cancel.check()
     ready = ready_path(source, mode)
     if destination.exists() and not (ready.exists() and os.path.samefile(ready, destination)):
         raise RuntimeError(f'Output already exists; refusing to replace {destination.name}')
     if not ready.exists():
-        encode(source, ready, mode, progress)
+        encode(source, ready, mode, progress, cancel=cancel)
+    if cancel is not None:
+        cancel.check()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
         os.link(ready, destination)

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.17.0
+
+- Add a matching 28px trash button to the right of active download/conversion progress bars. Confirming cancellation stops that job's process group and persistently ignores the video while other work continues.
+- Prevent canceled work from becoming completed or retryable, including overlapping conversion and download stages. Preserve completed files and allow explicit requeuing from the channel profile. No schema migration or configuration change is required.
+
 ## v0.16.2
 
 - Always skip active, scheduled, processing, and archived livestreams before downloading media or thumbnails, including manually queued videos and existing retries. yt-dlp checks its extraction metadata without a separate network lookup.

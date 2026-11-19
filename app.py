@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -30,9 +30,10 @@ import plex
 import channel_assets
 import ytdlp_runtime
 import video_encoding
+import job_control
 
 
-VERSION = "0.16.2"
+VERSION = "0.17.0"
 USER_AGENT = f"pullarr/{VERSION}"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -64,9 +65,11 @@ class DownloadProgress:
     def __init__(self):
         self.lock = threading.Lock()
         self.active = None
+        self.cancel = None
 
-    def start(self, entry: VideoEntry, status: str = "downloading") -> None:
+    def start(self, entry: VideoEntry, status: str = "downloading", cancel=None) -> None:
         with self.lock:
+            self.cancel = cancel
             self.active = {"video_id": entry.video_id, "channel_id": entry.channel_id,
                            "channel_title": entry.channel_title, "title": entry.title,
                            "status": status, "percent": None if status == "converting" else 0.0}
@@ -79,14 +82,19 @@ class DownloadProgress:
     def clear(self) -> None:
         with self.lock:
             self.active = None
+            self.cancel = None
 
     def snapshot(self) -> dict | None:
         with self.lock:
+            if self.cancel is not None and self.cancel.event.is_set():
+                return None
             return dict(self.active) if self.active is not None else None
 
 
 DOWNLOAD_PROGRESS = DownloadProgress()
 CONVERSION_PROGRESS = DownloadProgress()
+ACTIVE_JOBS = {}
+JOBS_LOCK = threading.Lock()
 
 
 def active_downloads() -> list[dict]:
@@ -545,6 +553,8 @@ def channel_profile(conn, channel_id, page=0):
         state = "not downloaded"
         if status == "downloaded":
             state = "downloaded"
+        elif status == "ignored":
+            state = "ignored"
         elif status in ("pending", "failed"):
             state = "queued"
         if video_id in active:
@@ -576,7 +586,7 @@ def queue_profile_videos(conn, channel_id, video_ids):
                                "https://www.youtube.com/watch?v=" + video_id)
             queue_entry(conn, entry, True)
             conn.execute("UPDATE videos SET status='pending',updated_at=? WHERE video_id=? "
-                         "AND status IN ('skipped_short','removed')", (utc_now(), video_id))
+                         "AND status IN ('skipped_short','removed','ignored')", (utc_now(), video_id))
 
 
 def fetch_publication_time(entry: VideoEntry) -> str:
@@ -706,17 +716,47 @@ def remove_download(conn: sqlite3.Connection, video_id: str) -> bool:
     return True
 
 
+def cancel_download(conn: sqlite3.Connection, video_id: str) -> bool:
+    """Commit the user's decision before signaling an active media job."""
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", video_id):
+        raise ValueError("Invalid video ID")
+    with JOBS_LOCK, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT status FROM videos WHERE video_id=?", (video_id,)).fetchone()
+        if row is None:
+            return False
+        if row[0] == 'ignored':
+            return True
+        cancel = ACTIVE_JOBS.get(video_id)
+        if row[0] not in ('pending', 'failed') or cancel is None:
+            raise ValueError("This video is no longer downloading or converting")
+        conn.execute("UPDATE videos SET status='ignored',last_error=NULL,updated_at=? WHERE video_id=?",
+                     (utc_now(), video_id))
+        conn.execute("DELETE FROM download_jobs WHERE video_id=?", (video_id,))
+        conn.commit()
+        cancel.cancel()
+    logging.info("Canceled media job %s; video ignored", video_id)
+    return True
+
+
+def check_ignored(conn: sqlite3.Connection, video_id: str) -> None:
+    row = conn.execute("SELECT status FROM videos WHERE video_id=?", (video_id,)).fetchone()
+    if row and row[0] == 'ignored':
+        raise job_control.Cancelled()
+
+
 class SkippedLivestream(Exception):
     """yt-dlp rejected confirmed livestream metadata before downloading media."""
 
 
-def stream_download(cmd: list[str]) -> str | None:
+def stream_download(cmd: list[str], cancel=None) -> str | None:
     """Consume machine-readable progress as it arrives, retaining bounded diagnostics."""
     output = deque(maxlen=40)
     file_path = None
     skipped_live = False
-    with subprocess.Popen(cmd, text=True, encoding="utf-8", errors="replace",
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1) as process:
+    cancel = cancel or job_control.Cancellation()
+    with cancel.process(cmd, text=True, encoding="utf-8", errors="replace",
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1) as process:
         for line in process.stdout:
             line = line.strip()
             progress = re.fullmatch(r"pullarr-progress:\s*(\d+(?:\.\d+)?)%", line)
@@ -762,6 +802,7 @@ class DownloadedVideo:
     root: Path
     mode: str
     source: Path
+    cancel: job_control.Cancellation = field(default_factory=job_control.Cancellation, compare=False)
 
 
 def staged_download(conn: sqlite3.Connection, entry: VideoEntry, root: Path) -> DownloadedVideo | None:
@@ -797,6 +838,9 @@ def staged_download(conn: sqlite3.Connection, entry: VideoEntry, root: Path) -> 
 
 def save_download_job(conn: sqlite3.Connection, job: DownloadedVideo) -> None:
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        check_ignored(conn, job.entry.video_id)
+        job.cancel.check()
         conn.execute("""INSERT INTO download_jobs(video_id,download_root,encoding,source_path)
             VALUES (?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET
             download_root=excluded.download_root,encoding=excluded.encoding,source_path=excluded.source_path""",
@@ -809,10 +853,19 @@ def convert_download(job: DownloadedVideo) -> Path:
     if not source.is_relative_to(staging_root):
         raise RuntimeError('Conversion source is outside its staging directory')
     destination = job.root / source.relative_to(staging_root).with_suffix('.mkv')
-    return video_encoding.convert(source, destination, job.mode, progress=CONVERSION_PROGRESS.update)
+    job.cancel.check()
+    return video_encoding.convert(source, destination, job.mode, progress=CONVERSION_PROGRESS.update,
+                                  cancel=job.cancel)
 
 
 def complete_download(conn: sqlite3.Connection, job: DownloadedVideo, file_path: str) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        check_ignored(conn, job.entry.video_id)
+        job.cancel.check()
+    except job_control.Cancelled:
+        conn.rollback()
+        raise
     if not Path(file_path).is_file():
         raise RuntimeError("Download/conversion did not produce a confirmed output file")
     if not Path(file_path).with_suffix(".jpg").is_file():
@@ -857,10 +910,13 @@ class ConversionPipeline:
     def submit(self, job: DownloadedVideo) -> bool:
         # The next source is downloaded, but cannot enter the encoder until it is free.
         self.finish()
+        job.cancel.check()
         if STOP:
             return False  # Leave the staged source queued for restart.
+        with JOBS_LOCK:
+            ACTIVE_JOBS[job.entry.video_id] = job.cancel
         self.job = job
-        CONVERSION_PROGRESS.start(job.entry, 'converting')
+        CONVERSION_PROGRESS.start(job.entry, 'converting', job.cancel)
         self.future = self.executor.submit(convert_download, job)
         return True
 
@@ -870,9 +926,13 @@ class ConversionPipeline:
         try:
             file_path = str(self.future.result())
             complete_download(self.conn, self.job, file_path)
+        except job_control.Cancelled:
+            logging.info("Conversion canceled for %s", self.job.entry.video_id)
         except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
             fail_download(self.conn, self.job.entry, exc)
         finally:
+            with JOBS_LOCK:
+                ACTIVE_JOBS.pop(self.job.entry.video_id, None)
             self.future = None
             self.job = None
             CONVERSION_PROGRESS.clear()
@@ -889,6 +949,8 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
     status = conn.execute("SELECT status FROM videos WHERE video_id=?", (entry.video_id,)).fetchone()
     if status and status[0] == 'downloaded':
         return True
+    if status and status[0] == 'ignored':
+        return False
     download_root = get_download_root(conn, config.download_root)
     mode = video_encoding.get_mode(conn)
     staging_root = download_root / '.pullarr-partial' / mode / entry.video_id
@@ -922,11 +984,18 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
         entry.url,
     ]
 
+    cancel = job_control.Cancellation()
+    handed_off = False
     try:
         job = staged_download(conn, entry, download_root)
+        if job is not None:
+            cancel = job.cancel
+        with JOBS_LOCK:
+            ACTIVE_JOBS[entry.video_id] = cancel
+        check_ignored(conn, entry.video_id)
         if job is None:
             logging.info("Downloading %s - %s", entry.channel_title, entry.title)
-            DOWNLOAD_PROGRESS.start(entry)
+            DOWNLOAD_PROGRESS.start(entry, cancel=cancel)
             if get_skip_shorts(conn) and is_short(entry.video_id):
                 with conn:
                     # Serialize with settings saves after the network request.
@@ -937,11 +1006,13 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
                         logging.info("Skipped Short %s - %s", entry.channel_title, entry.video_id)
                         return False
             download_root.mkdir(parents=True, exist_ok=True)
+            cancel.check()
             with ytdlp_runtime.command(skip_live=True) as executable:
-                file_path = stream_download(executable + cmd)
+                file_path = stream_download(executable + cmd, cancel=cancel)
+            cancel.check()
             if not file_path or not Path(file_path).is_file():
                 raise RuntimeError("yt-dlp did not produce a confirmed output file")
-            job = DownloadedVideo(entry, download_root, mode, Path(file_path))
+            job = DownloadedVideo(entry, download_root, mode, Path(file_path), cancel)
         else:
             logging.info("Resuming saved download %s locally (%s)", entry.video_id, job.mode)
             mode = job.mode
@@ -950,15 +1021,19 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
         if mode != 'original' and pipeline is not None:
             ready = video_encoding.ready_path(job.source, mode).is_file()
             submitted = pipeline.submit(job)
+            handed_off = submitted
             if submitted and ready:
                 pipeline.finish()  # Commit recovered output before another network operation can block.
             return submitted
         if mode != 'original':
-            CONVERSION_PROGRESS.start(entry, 'converting')
+            CONVERSION_PROGRESS.start(entry, 'converting', cancel)
             DOWNLOAD_PROGRESS.clear()
             file_path = str(convert_download(job))
         complete_download(conn, job, file_path)
         return True
+    except job_control.Cancelled:
+        logging.info("Media job canceled for %s", entry.video_id)
+        return False
     except SkippedLivestream:
         with conn:
             conn.execute("UPDATE videos SET status='skipped_live',last_error=NULL,updated_at=? "
@@ -969,6 +1044,9 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
         fail_download(conn, entry, exc)
         return False
     finally:
+        if not handed_off:
+            with JOBS_LOCK:
+                ACTIVE_JOBS.pop(entry.video_id, None)
         DOWNLOAD_PROGRESS.clear()
         if pipeline is None:
             CONVERSION_PROGRESS.clear()
@@ -1087,7 +1165,7 @@ def run_once(config: AppConfig, conn: sqlite3.Connection) -> None:
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pullarr</title><style>
 
 :root{color-scheme:dark;font:13px/1.5 system-ui,sans-serif;--red:#ec4e20;--orange:#ff9505;--blue:#016fb9;--plum:#64113f;--green:#111d13;--bg:#0c130f;--surface:#111d13;--raised:#17251c;--line:#2b3a30;--text:#ecf0ec;--muted:#a2b0a6}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}[hidden]{display:none!important}button,input,select{font:inherit}a{color:#71bdf0}button,a,input,select{outline-offset:4px}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--orange)}button{cursor:pointer;border:1px solid transparent;border-radius:6px;background:var(--orange);color:#171208;font-weight:650;padding:7px 12px}button:disabled,input:disabled,select:disabled{opacity:.55;cursor:default}p,small,.sub{color:var(--muted)}p{margin:8px 0 14px}h1,h2,h3{line-height:1.3}h1{font-size:24px;margin:0 0 6px;letter-spacing:-.6px}h2{font-size:15px;margin:0 0 14px}h3{font-size:13px;margin:0}input:not(.switch){flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px}select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 9px;max-width:100%}.sidebar{width:200px;position:fixed;inset:0 auto 0 0;background:var(--green);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:26px 14px;z-index:2}.brand{display:flex;align-items:center;gap:6px;font-size:21px;font-weight:750;padding:0 0 30px;letter-spacing:-.7px}.brand-version{font-size:10px;font-weight:500;letter-spacing:0;color:var(--muted);white-space:nowrap}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:var(--orange);color:var(--green);font-size:19px}.nav-label{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);padding:0 12px;margin-bottom:8px}.tabs{display:grid;gap:5px}.tabs a{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--muted);padding:10px 12px;border-radius:6px;font-weight:550}.tabs a:hover{background:var(--raised);color:var(--text)}.tabs a[aria-current="page"]{background:var(--blue);color:white}.nav-count{margin-left:auto;min-width:20px;padding:1px 5px;border-radius:4px;background:var(--raised);color:var(--text);font-size:10px;font-variant-numeric:tabular-nums;text-align:center}.nav-icon{width:18px;text-align:center;font-size:17px}main{margin-left:200px;max-width:1640px;padding:0 32px 32px}.topbar{height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);margin-bottom:30px}.eyebrow{font-size:10px;color:var(--orange);text-transform:uppercase;letter-spacing:1.7px;margin-bottom:9px}.page-intro{margin-bottom:24px}.panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:18px}.add,.controls{display:flex;align-items:center;gap:9px}.add input{width:100%}.switch{width:48px;height:27px;min-width:48px;max-width:48px;flex:0 0 48px;display:inline-block;margin:0;appearance:none;background:#425247;border-radius:30px;cursor:pointer;position:relative;vertical-align:middle}.switch:before{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:white;transition:transform .16s}.switch:checked{background:var(--blue)}.switch:checked:before{transform:translateX(21px)}.remove{background:var(--raised);border-color:var(--line);color:var(--text);font-size:11px;padding:5px 9px}.remove:hover{color:#ffad91;border-color:var(--red)}.name{font-weight:600;overflow-wrap:anywhere}.sub{font-size:11px;overflow-wrap:anywhere}.profile-link{background:none;color:var(--text);padding:0;text-align:left;font-size:inherit}.profile-link:hover{color:#71bdf0}.mode-label{font-size:11px;color:var(--muted)}.mode-label select{margin-left:8px}.video-table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}caption{text-align:left;color:var(--muted);padding-bottom:12px}th{text-transform:uppercase;letter-spacing:.7px;font-size:10px;color:var(--muted);font-weight:550;background:var(--raised)}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:#19291f}td{vertical-align:middle}td:first-child{min-width:200px}td .switch{vertical-align:middle}.download-status{min-width:190px;width:230px}.download-progress{position:relative;height:28px}.download-progress progress{display:block;appearance:none;width:100%;height:100%;margin:0;border:0;border-radius:6px;overflow:hidden;background:var(--bg);accent-color:var(--blue)}.download-progress progress::-webkit-progress-bar{background:var(--bg)}.download-progress progress::-webkit-progress-value{background:var(--blue)}.download-progress progress::-moz-progress-bar{background:var(--blue)}.progress-label{position:absolute;inset:0;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;white-space:nowrap;pointer-events:none}.download-status .remove{margin-left:8px}.queue-note{margin-top:3px}.video-table input[type=checkbox]{width:16px;height:16px;accent-color:var(--blue)}.history-toggle{display:flex;align-items:center;gap:10px;font-size:12px}.panel-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.panel-heading h2{margin:0}#msg,#downloads-message,#settings-message,#plex-message,#home-message,#profile-message{color:#ffb45c}p[role=status]:empty{display:none}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px}.stat{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px}.stat span{color:var(--muted);font-size:11px}.stat strong{display:block;font-size:30px;line-height:1.4;margin:8px 0;color:var(--orange);font-weight:600}.stat:nth-child(2) strong{color:#71bdf0}.stat:nth-child(3){border-top:2px solid var(--plum)}.stat:nth-child(4){border-top:2px solid var(--red)}.stat small{font-size:10px}.empty{padding:28px 12px;text-align:center;color:var(--muted)}#plex-fields{border:0;padding:0;margin:0;min-width:0}.setting-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.3fr);gap:24px;align-items:center;border-bottom:1px solid var(--line);padding:14px 0}.setting-row:first-child{padding-top:0}.setting-row label{font-weight:550}.setting-row p{font-size:11px;margin:4px 0 0;max-width:540px}.setting-row input:not(.switch){width:100%}.setting-row small{display:block;margin-top:5px}.settings-actions{display:flex;gap:8px;align-items:center;padding-top:16px}.settings-note{font-size:11px}.plex-label{display:block}.profile-actions{margin-bottom:12px}#channel-profile .controls{flex-wrap:wrap}#channel-profile td:first-child{min-width:0}#channel-profile td:nth-child(3){min-width:240px}#profile-back{float:right}#profile-page{color:var(--muted);font-size:11px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}[hidden]{display:none!important}button,input,select{font:inherit}a{color:#71bdf0}button,a,input,select{outline-offset:4px}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--orange)}button{cursor:pointer;border:1px solid transparent;border-radius:6px;background:var(--orange);color:#171208;font-weight:650;padding:7px 12px}button:disabled,input:disabled,select:disabled{opacity:.55;cursor:default}p,small,.sub{color:var(--muted)}p{margin:8px 0 14px}h1,h2,h3{line-height:1.3}h1{font-size:24px;margin:0 0 6px;letter-spacing:-.6px}h2{font-size:15px;margin:0 0 14px}h3{font-size:13px;margin:0}input:not(.switch){flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px}select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 9px;max-width:100%}.sidebar{width:200px;position:fixed;inset:0 auto 0 0;background:var(--green);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:26px 14px;z-index:2}.brand{display:flex;align-items:center;gap:6px;font-size:21px;font-weight:750;padding:0 0 30px;letter-spacing:-.7px}.brand-version{font-size:10px;font-weight:500;letter-spacing:0;color:var(--muted);white-space:nowrap}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:var(--orange);color:var(--green);font-size:19px}.nav-label{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);padding:0 12px;margin-bottom:8px}.tabs{display:grid;gap:5px}.tabs a{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--muted);padding:10px 12px;border-radius:6px;font-weight:550}.tabs a:hover{background:var(--raised);color:var(--text)}.tabs a[aria-current="page"]{background:var(--blue);color:white}.nav-count{margin-left:auto;min-width:20px;padding:1px 5px;border-radius:4px;background:var(--raised);color:var(--text);font-size:10px;font-variant-numeric:tabular-nums;text-align:center}.nav-icon{width:18px;text-align:center;font-size:17px}main{margin-left:200px;max-width:1640px;padding:0 32px 32px}.topbar{height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);margin-bottom:30px}.eyebrow{font-size:10px;color:var(--orange);text-transform:uppercase;letter-spacing:1.7px;margin-bottom:9px}.page-intro{margin-bottom:24px}.panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:18px}.add,.controls{display:flex;align-items:center;gap:9px}.add input{width:100%}.switch{width:48px;height:27px;min-width:48px;max-width:48px;flex:0 0 48px;display:inline-block;margin:0;appearance:none;background:#425247;border-radius:30px;cursor:pointer;position:relative;vertical-align:middle}.switch:before{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:white;transition:transform .16s}.switch:checked{background:var(--blue)}.switch:checked:before{transform:translateX(21px)}.remove{background:var(--raised);border-color:var(--line);color:var(--text);font-size:11px;padding:5px 9px}.remove:hover{color:#ffad91;border-color:var(--red)}.name{font-weight:600;overflow-wrap:anywhere}.sub{font-size:11px;overflow-wrap:anywhere}.profile-link{background:none;color:var(--text);padding:0;text-align:left;font-size:inherit}.profile-link:hover{color:#71bdf0}.mode-label{font-size:11px;color:var(--muted)}.mode-label select{margin-left:8px}.video-table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}caption{text-align:left;color:var(--muted);padding-bottom:12px}th{text-transform:uppercase;letter-spacing:.7px;font-size:10px;color:var(--muted);font-weight:550;background:var(--raised)}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:#19291f}td{vertical-align:middle}td:first-child{min-width:200px}td .switch{vertical-align:middle}.download-status{min-width:190px;width:230px}.download-progress{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:8px;height:28px}.download-progress progress{display:block;appearance:none;width:100%;height:100%;margin:0;border:0;border-radius:6px;overflow:hidden;background:var(--bg);accent-color:var(--blue)}.download-progress progress::-webkit-progress-bar{background:var(--bg)}.download-progress progress::-webkit-progress-value{background:var(--blue)}.download-progress progress::-moz-progress-bar{background:var(--blue)}.progress-label{position:absolute;inset:0 36px 0 0;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:600;white-space:nowrap;pointer-events:none}.cancel-download{display:grid;place-items:center;min-width:28px;min-height:28px;padding:0;border:0;border-radius:6px;background:var(--bg);color:#ffa287}.cancel-download:hover:not(:disabled){background:var(--red);color:#fff}.cancel-download::before{content:"";width:16px;height:16px;background:currentColor;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7'/%3E%3C/svg%3E") center/contain no-repeat;pointer-events:none;forced-color-adjust:none}.download-status .remove{margin-left:8px}.queue-note{margin-top:3px}.video-table input[type=checkbox]{width:16px;height:16px;accent-color:var(--blue)}.history-toggle{display:flex;align-items:center;gap:10px;font-size:12px}.panel-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.panel-heading h2{margin:0}#msg,#downloads-message,#settings-message,#plex-message,#home-message,#profile-message{color:#ffb45c}p[role=status]:empty{display:none}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px}.stat{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px}.stat span{color:var(--muted);font-size:11px}.stat strong{display:block;font-size:30px;line-height:1.4;margin:8px 0;color:var(--orange);font-weight:600}.stat:nth-child(2) strong{color:#71bdf0}.stat:nth-child(3){border-top:2px solid var(--plum)}.stat:nth-child(4){border-top:2px solid var(--red)}.stat small{font-size:10px}.empty{padding:28px 12px;text-align:center;color:var(--muted)}#plex-fields{border:0;padding:0;margin:0;min-width:0}.setting-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.3fr);gap:24px;align-items:center;border-bottom:1px solid var(--line);padding:14px 0}.setting-row:first-child{padding-top:0}.setting-row label{font-weight:550}.setting-row p{font-size:11px;margin:4px 0 0;max-width:540px}.setting-row input:not(.switch){width:100%}.setting-row small{display:block;margin-top:5px}.settings-actions{display:flex;gap:8px;align-items:center;padding-top:16px}.settings-note{font-size:11px}.plex-label{display:block}.profile-actions{margin-bottom:12px}#channel-profile .controls{flex-wrap:wrap}#channel-profile td:first-child{min-width:0}#channel-profile td:nth-child(3){min-width:240px}#profile-back{float:right}#profile-page{color:var(--muted);font-size:11px}
 @media(min-width:1500px){main{padding-left:44px;padding-right:44px}}@media(max-width:900px){.sidebar{width:164px}.brand{font-size:17px;padding-left:0}main{margin-left:164px;padding:0 18px 24px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.setting-row{grid-template-columns:1fr;gap:10px}.panel-heading{align-items:flex-start;flex-wrap:wrap}}@media(max-width:600px){.sidebar{width:100%;position:sticky;top:0;padding:10px;border-right:0;border-bottom:1px solid var(--line)}.brand,.nav-label{display:none}.tabs{display:flex;justify-content:space-between;gap:3px}.tabs a{padding:8px 4px;font-size:10px;gap:3px}.nav-count{min-width:16px;padding:1px 3px;font-size:9px}.nav-icon{font-size:14px;width:15px}main{margin-left:0;padding:0 12px 20px}.topbar{height:48px;margin-bottom:20px}.add{flex-wrap:wrap}.add input{flex-basis:100%}.panel{padding:13px}.stats{gap:9px}.stat{padding:13px}.stat strong{font-size:25px}.page-intro{margin-bottom:18px}.video-table{margin:0 -3px}}
 </style></head><body><aside class="sidebar"><div class="brand"><span class="brand-mark" aria-hidden="true">↧</span>Pullarr<small class="brand-version">v__APP_VERSION__</small></div><div class="nav-label">Workspace</div><nav class="tabs" aria-label="Main navigation">
 <a id="home-tab" href="#home" aria-current="page"><span class="nav-icon" aria-hidden="true">⌂</span>Home</a>
@@ -1124,7 +1202,7 @@ function profileLength(duration){
 }
 function profileRow(item,enabled){
     const row=document.createElement('tr'),selection=document.createElement('td'),box=document.createElement('input');
-    box.type='checkbox';box.disabled=!enabled||item.status!=='not downloaded';
+    box.type='checkbox';box.disabled=!enabled||!['not downloaded','ignored'].includes(item.status);
     box.setAttribute('aria-label','Select '+item.title);
     if(box.disabled)profileSelection.delete(item.video_id);
     box.checked=profileSelection.has(item.video_id);
@@ -1234,6 +1312,16 @@ let settingsLoaded=false;
 let settingsBusy=false;
 let downloadsBusy=false;
 let removingDownload=false;
+let cancelingDownload=false;
+async function cancelActive(item,button){
+    if(cancelingDownload||!confirm('Cancel “'+item.title+'” and ignore this video? It will not retry automatically.'))return;
+    cancelingDownload=true;button.disabled=true;
+    try{
+        await request('/api/downloads/cancel',{video_id:item.video_id});
+        cancelingDownload=false;await Promise.all([refreshDownloads(),refreshOverview()]);
+    }catch(e){$('downloads-message').textContent=e.message}
+    finally{cancelingDownload=false;button.disabled=false}
+}
 async function removeDownloaded(item,remove){
     if(removingDownload||!confirm('Delete the downloaded file for “'+item.title+'”? This cannot be undone. Pullarr will remember it so it is not downloaded again.'))return;
     removingDownload=true;remove.disabled=true;
@@ -1254,7 +1342,10 @@ function activeProgress(item,state){
     if(percent!==null)bar.value=percent;
     bar.setAttribute('aria-label',(converting?'Conversion':'Download')+' progress for '+item.title);
     bar.setAttribute('aria-valuetext',label.textContent);
-    wrapper.append(bar,label);state.append(wrapper);
+    const cancel=document.createElement('button');cancel.className='cancel-download';cancel.type='button';
+    cancel.setAttribute('aria-label','Cancel '+(converting?'conversion':'download')+' for '+item.title);
+    cancel.title='Cancel and ignore video';cancel.onclick=()=>cancelActive(item,cancel);
+    wrapper.append(bar,label,cancel);state.append(wrapper);
 }
 function downloadState(item){
     const state=document.createElement('td');state.className='download-status';
@@ -1276,12 +1367,12 @@ function downloadState(item){
     return state;
 }
 async function refreshDownloads(){
-    if(downloadsBusy||removingDownload)return;
+    if(downloadsBusy||removingDownload||cancelingDownload)return;
     downloadsBusy=true;
     const includeDownloaded=$('show-downloaded').checked;
     try{
         const items=await request('/api/downloads'+(includeDownloaded?'?include_downloaded=1':''));
-        if(includeDownloaded!==$('show-downloaded').checked)return;
+        if(cancelingDownload||includeDownloaded!==$('show-downloaded').checked)return;
         $('downloads-message').textContent='';
         $('downloads-count').textContent=items.filter(item=>item.status!=='downloaded').length;
         const rows=[];
@@ -1472,7 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path not in ("/api/channel-videos/scan", "/api/channel-videos/queue", "/api/channels", "/api/toggle", "/api/remove", "/api/download-mode", "/api/settings", "/api/downloads/remove", "/api/plex", "/api/plex/test"):
+        if self.path not in ("/api/channel-videos/scan", "/api/channel-videos/queue", "/api/channels", "/api/toggle", "/api/remove", "/api/download-mode", "/api/settings", "/api/downloads/remove", "/api/downloads/cancel", "/api/plex", "/api/plex/test"):
             return self.send(404, {"error": "Not found"})
         # Prevent cross-origin browser forms from modifying settings.
         origin = self.headers.get("Origin")
@@ -1496,6 +1587,12 @@ class Handler(BaseHTTPRequestHandler):
                 with closing(sqlite3.connect(self.db_path)) as conn:
                     message = plex.test_connection(conn)
                 return self.send(200, {"message": message})
+            if self.path == "/api/downloads/cancel":
+                with closing(sqlite3.connect(self.db_path, timeout=30)) as conn:
+                    canceled = cancel_download(conn, data.get("video_id"))
+                if not canceled:
+                    return self.send(404, {"error": "Video not found"})
+                return self.send(200, {"ok": True})
             if self.path == "/api/downloads/remove":
                 with closing(sqlite3.connect(self.db_path, timeout=30)) as conn:
                     removed = remove_download(conn, data.get("video_id"))
