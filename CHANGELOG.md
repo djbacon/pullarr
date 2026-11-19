@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.17.2
+
+- Fix invisible cancel icons by drawing the trash icon as inline SVG instead of a CSS image mask blocked by the Content Security Policy. Preserve button sizing, keyboard controls, and confirmation behavior.
+
 ## v0.17.1
 
 - Keep confirmed livestream skips out of the queue even when yt-dlp exits with an error. Preserve skipped IDs across discovery and restarts.

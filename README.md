@@ -1,4 +1,4 @@
-# Pullarr v0.17.1
+# Pullarr v0.17.2
 
 Lightweight YouTube RSS auto-downloader with a built-in web interface. No YAML configuration file is needed.
 
@@ -6,7 +6,7 @@ Livestreams are always skipped, including scheduled streams and archived recordi
 
 Scheduled or processing streams without media formats still reach the livestream filter. Once yt-dlp confirms a livestream skip, its ID stays skipped even if yt-dlp subsequently exits with an error; it does not return to the queue. Previously retrying streams are skipped on their next download attempt.
 
-Active downloads and conversions have a trash button immediately to the right of their progress bar. Confirming **Cancel** stops that video's processes and marks it **ignored** in SQLite, removing it from the queue across polls and restarts. Other active work continues. Canceled work is not resumed or automatically requeued when the channel selection changes. You can explicitly select it again in its channel profile. Already downloaded media is preserved; incomplete staging files are reclaimed by the existing empty-queue cleanup. No database migration or new setting is required.
+Active downloads and conversions have a trash button immediately to the right of their progress bar. Its inline SVG icon works with Pullarr’s Content Security Policy, including when embedded image URLs are blocked. Confirming **Cancel** stops that video's processes and marks it **ignored** in SQLite, removing it from the queue across polls and restarts. Other active work continues. Canceled work is not resumed or automatically requeued when the channel selection changes. You can explicitly select it again in its channel profile. Already downloaded media is preserved; incomplete staging files are reclaimed by the existing empty-queue cleanup. No database migration or new setting is required.
 
 ## Interface
 

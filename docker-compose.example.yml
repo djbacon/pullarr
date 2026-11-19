@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: 0.17.1
+        APP_VERSION: 0.17.2
     container_name: pullarr
     restart: unless-stopped
     ports:

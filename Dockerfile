@@ -2,7 +2,7 @@ FROM denoland/deno:bin-2.9.7 AS deno
 
 FROM python:3.13-slim
 
-ARG APP_VERSION=0.17.1
+ARG APP_VERSION=0.17.2
 LABEL org.opencontainers.image.title="Pullarr" \
       org.opencontainers.image.version="$APP_VERSION"
 
