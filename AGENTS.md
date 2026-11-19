@@ -7,6 +7,7 @@
 - Prefer standard-library solutions, focused functions, existing conventions, sequential downloads, and minimal dependencies. Avoid unnecessary rewrites, services, abstractions, duplicate functionality, and dead code. Log contextual errors; never silently hide failures.
 - Preserve subscriptions, history, downloaded media, and restart recovery. Never modify the user's active Compose configuration or existing volume mappings.
 - Validate URLs/IDs, prevent path traversal and shell injection, use network timeouts, safely render untrusted text, and keep secrets/sensitive files out of logs, API responses, and HTTP serving.
+- Before making new changes, inspect the Git working tree and commit outstanding changes from previous work after the required validation. Keep previous work in separate commits from the new task, exclude unrelated user changes, and report the commit hashes.
 - After completing each set of modifications and required validation, automatically create a Git commit without asking for confirmation. Include only changes made for the current task, use a clear message describing the result, and report the commit hash. Do not create empty commits or include unrelated user changes. Commit locally; push only when explicitly requested.
 
 ## Read detailed rules only when relevant
