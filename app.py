@@ -33,7 +33,7 @@ import video_encoding
 import job_control
 
 
-VERSION = "0.17.0"
+VERSION = "0.17.1"
 USER_AGENT = f"pullarr/{VERSION}"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -773,9 +773,12 @@ def stream_download(cmd: list[str], cancel=None) -> str | None:
                     logging.warning("Invalid output path from yt-dlp")
             elif line:
                 output.append(line[-4000:])
-        if process.wait():
+        returncode = process.wait()
+        if returncode and not skipped_live:
             raise subprocess.CalledProcessError(process.returncode, cmd, output="\n".join(output)[-4000:])
     if skipped_live:
+        if returncode:
+            logging.warning("yt-dlp exited with status %s after confirming a livestream skip", returncode)
         raise SkippedLivestream()
     return file_path
 

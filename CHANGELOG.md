@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.17.1
+
+- Keep confirmed livestream skips out of the queue even when yt-dlp exits with an error. Preserve skipped IDs across discovery and restarts.
+- Allow scheduled and processing streams without media formats to reach the existing livestream filter. Ordinary failures still retry; no schema migration or configuration change is required.
+
 ## v0.17.0
 
 - Add a matching 28px trash button to the right of active download/conversion progress bars. Confirming cancellation stops that job's process group and persistently ignores the video while other work continues.

@@ -34,6 +34,9 @@ def skip_live(info, *, incomplete=False):
 
 options = parse_options()
 options.ydl_opts['match_filter'] = skip_live
+# Let unavailable streams expose their metadata to the filter. Other failures
+# still retry because Pullarr requires a confirmed output file for success.
+options.ydl_opts['ignore_no_formats_error'] = True
 with YoutubeDL(options.ydl_opts) as ydl:
     if options.options.load_info_filename is not None:
         sys.exit(ydl.download_with_info_file(options.options.load_info_filename))
