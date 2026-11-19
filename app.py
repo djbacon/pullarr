@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import deque
-from contextlib import closing
+from contextlib import closing, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -33,7 +33,7 @@ import video_encoding
 import job_control
 
 
-VERSION = "0.17.2"
+VERSION = "0.18.0"
 USER_AGENT = f"pullarr/{VERSION}"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -850,18 +850,55 @@ def save_download_job(conn: sqlite3.Connection, job: DownloadedVideo) -> None:
             (job.entry.video_id, str(job.root.resolve()), job.mode, str(job.source.absolute())))
 
 
-def convert_download(job: DownloadedVideo) -> Path:
+def convert_download(job: DownloadedVideo, report_progress: bool = True) -> Path:
     source = job.source.resolve()
     staging_root = (job.root / '.pullarr-partial' / job.mode / job.entry.video_id).resolve()
     if not source.is_relative_to(staging_root):
         raise RuntimeError('Conversion source is outside its staging directory')
     destination = job.root / source.relative_to(staging_root).with_suffix('.mkv')
+    if (not staging_root.is_relative_to(job.root.resolve())
+            or not destination.resolve().is_relative_to(job.root.resolve())):
+        raise RuntimeError('Conversion destination is outside the download directory')
     job.cancel.check()
-    return video_encoding.convert(source, destination, job.mode, progress=CONVERSION_PROGRESS.update,
+    return video_encoding.convert(source, destination, job.mode,
+                                  progress=CONVERSION_PROGRESS.update if report_progress else None,
                                   cancel=job.cancel)
 
 
+def publish_download(job: DownloadedVideo) -> None:
+    """Expose the downloaded original, retaining its staging link for safe replacement/recovery."""
+    source = job.source.resolve()
+    staging = (job.root / '.pullarr-partial' / job.mode / job.entry.video_id).resolve()
+    root = job.root.resolve()
+    if not staging.is_relative_to(root) or not source.is_relative_to(staging):
+        raise RuntimeError('Download source is outside its staging directory')
+    destination = root / source.relative_to(staging)
+    if not destination.resolve().is_relative_to(root):
+        raise RuntimeError('Download destination is outside the download directory')
+    ready = video_encoding.ready_path(source, job.mode)
+    job.cancel.check()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        if not (os.path.samefile(source, destination)
+                or (ready.is_file() and os.path.samefile(ready, destination))):
+            raise RuntimeError(f'Output already exists; refusing to replace {destination.name}') from None
+    artwork = source.with_suffix('.jpg')
+    if artwork.is_file():
+        try:
+            os.link(artwork, destination.with_suffix('.jpg'))
+        except FileExistsError:
+            pass
+    try:
+        channel_assets.episode_nfo(destination, job.entry.title, job.entry.video_id)
+    except (OSError, ValueError) as exc:
+        logging.warning('Episode metadata pending for %s: %s', job.entry.video_id, exc)
+
+
 def complete_download(conn: sqlite3.Connection, job: DownloadedVideo, file_path: str) -> None:
+    if not Path(file_path).is_file():
+        raise RuntimeError("Download/conversion did not produce a confirmed output file")
     conn.execute("BEGIN IMMEDIATE")
     try:
         check_ignored(conn, job.entry.video_id)
@@ -869,8 +906,6 @@ def complete_download(conn: sqlite3.Connection, job: DownloadedVideo, file_path:
     except job_control.Cancelled:
         conn.rollback()
         raise
-    if not Path(file_path).is_file():
-        raise RuntimeError("Download/conversion did not produce a confirmed output file")
     if not Path(file_path).with_suffix(".jpg").is_file():
         logging.warning("YouTube thumbnail missing for %s; video saved without episode artwork", job.entry.video_id)
     conn.execute("""UPDATE videos SET status='downloaded',attempts=attempts+1,
@@ -884,6 +919,13 @@ def complete_download(conn: sqlite3.Connection, job: DownloadedVideo, file_path:
     plex.enqueue_scan(conn, file_path, job.root)
     conn.commit()
     if job.mode != 'original':
+        staging = (job.root / '.pullarr-partial' / job.mode / job.entry.video_id).resolve()
+        original = job.root.resolve() / job.source.resolve().relative_to(staging)
+        try:
+            if original != Path(file_path) and original.is_file() and os.path.samefile(original, job.source):
+                original.unlink()
+        except OSError as exc:
+            logging.warning('Could not remove replaced original %s: %s', original, exc)
         video_encoding.cleanup(job.source, job.mode)
     logging.info("Downloaded %s", file_path)
     notify_plex(conn)
@@ -900,45 +942,52 @@ def fail_download(conn: sqlite3.Connection, entry: VideoEntry, exc: Exception) -
 
 
 class ConversionPipeline:
-    """One encoder and one next download; only the calling thread writes SQLite."""
+    """One independent encoder; each thread owns its SQLite connection."""
     def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
+        self.db_path = conn.execute('PRAGMA database_list').fetchone()[2]
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pullarr-encode')
-        self.future = None
-        self.job = None
+        self.futures = deque()
 
     def __enter__(self):
         return self
 
     def submit(self, job: DownloadedVideo) -> bool:
-        # The next source is downloaded, but cannot enter the encoder until it is free.
-        self.finish()
+        while self.futures and self.futures[0].done():
+            self.futures.popleft().result()
         job.cancel.check()
         if STOP:
-            return False  # Leave the staged source queued for restart.
+            return False  # Leave the published source queued for restart.
         with JOBS_LOCK:
             ACTIVE_JOBS[job.entry.video_id] = job.cancel
-        self.job = job
-        CONVERSION_PROGRESS.start(job.entry, 'converting', job.cancel)
-        self.future = self.executor.submit(convert_download, job)
+        self.futures.append(self.executor.submit(self.convert, job))
         return True
 
-    def finish(self) -> None:
-        if self.future is None:
-            return
+    def convert(self, job: DownloadedVideo) -> None:
         try:
-            file_path = str(self.future.result())
-            complete_download(self.conn, self.job, file_path)
-        except job_control.Cancelled:
-            logging.info("Conversion canceled for %s", self.job.entry.video_id)
-        except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
-            fail_download(self.conn, self.job.entry, exc)
+            if STOP:
+                return
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as conn:
+                try:
+                    check_ignored(conn, job.entry.video_id)
+                    job.cancel.check()
+                    CONVERSION_PROGRESS.start(job.entry, 'converting', job.cancel)
+                    file_path = str(convert_download(job))
+                    complete_download(conn, job, file_path)
+                except job_control.Cancelled:
+                    logging.info("Conversion canceled for %s", job.entry.video_id)
+                except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
+                    conn.rollback()
+                    fail_download(conn, job.entry, exc)
+        except Exception:
+            logging.exception('Conversion job failed for %s; saved source retained for retry', job.entry.video_id)
         finally:
             with JOBS_LOCK:
-                ACTIVE_JOBS.pop(self.job.entry.video_id, None)
-            self.future = None
-            self.job = None
+                ACTIVE_JOBS.pop(job.entry.video_id, None)
             CONVERSION_PROGRESS.clear()
+
+    def finish(self) -> None:
+        while self.futures:
+            self.futures.popleft().result()
 
     def __exit__(self, exc_type, exc, traceback):
         try:
@@ -949,6 +998,9 @@ class ConversionPipeline:
 
 def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntry,
                    pipeline: ConversionPipeline | None = None) -> bool:
+    with JOBS_LOCK:
+        if entry.video_id in ACTIVE_JOBS:
+            return True  # Already queued for the independent encoder, including across polls.
     status = conn.execute("SELECT status FROM videos WHERE video_id=?", (entry.video_id,)).fetchone()
     if status and status[0] == 'downloaded':
         return True
@@ -1021,12 +1073,17 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
             mode = job.mode
             file_path = str(job.source)
         save_download_job(conn, job)
+        if mode != 'original' and job.source.is_file():
+            publish_download(job)
         if mode != 'original' and pipeline is not None:
-            ready = video_encoding.ready_path(job.source, mode).is_file()
+            if video_encoding.ready_path(job.source, mode).is_file():
+                # Ready output has already been validated. Recover it without waiting
+                # behind the encoder queue or changing another video's live progress.
+                file_path = str(convert_download(job, report_progress=False))
+                complete_download(conn, job, file_path)
+                return True
             submitted = pipeline.submit(job)
             handed_off = submitted
-            if submitted and ready:
-                pipeline.finish()  # Commit recovered output before another network operation can block.
             return submitted
         if mode != 'original':
             CONVERSION_PROGRESS.start(entry, 'converting', cancel)
@@ -1127,6 +1184,9 @@ def cleanup_idle_downloads(config: AppConfig, conn: sqlite3.Connection) -> None:
     """Reclaim only worker staging files after completion, retaining retry inputs."""
     if STOP or active_downloads():
         return
+    with JOBS_LOCK:
+        if ACTIVE_JOBS:
+            return  # Include queued conversions, even if their subscription was removed.
     try:
         with conn:
             # Keep UI queue/settings writes serialized with the empty-queue check.
@@ -1144,11 +1204,12 @@ def cleanup_idle_downloads(config: AppConfig, conn: sqlite3.Connection) -> None:
         logging.warning("Could not clean download staging files; will retry next poll: %s", exc)
 
 
-def run_once(config: AppConfig, conn: sqlite3.Connection) -> None:
+def run_once(config: AppConfig, conn: sqlite3.Connection,
+             pipeline: ConversionPipeline | None = None) -> None:
     notify_plex(conn)
     channels = [ChannelConfig(channel_id=row[0]) for row in conn.execute(
         "SELECT channel_id FROM subscriptions WHERE enabled = 1 ORDER BY title COLLATE NOCASE")]
-    with ConversionPipeline(conn) as pipeline:
+    with (nullcontext(pipeline) if pipeline is not None else ConversionPipeline(conn)) as encoder:
         for channel in channels:
             if STOP:
                 break
@@ -1159,7 +1220,7 @@ def run_once(config: AppConfig, conn: sqlite3.Connection) -> None:
                     continue
                 root = get_download_root(conn, config.download_root)
                 channel_assets.sync(conn, channel.channel_id, root / safe_component(row[0]), root)
-                process_channel(config, conn, channel, pipeline)
+                process_channel(config, conn, channel, encoder)
             except Exception:
                 logging.exception("Channel check failed for %s", channel.channel_id)
     cleanup_idle_downloads(config, conn)
@@ -1690,10 +1751,11 @@ def main() -> int:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logging.info("Pullarr v%s started; web UI on port %s", VERSION, server.server_port)
     try:
-        while not STOP:
-            WAKE.clear()
-            run_once(config, conn)
-            WAKE.wait(config.poll_interval_seconds)
+        with ConversionPipeline(conn) as pipeline:
+            while not STOP:
+                WAKE.clear()
+                run_once(config, conn, pipeline)
+                WAKE.wait(config.poll_interval_seconds)
     finally:
         updater_stop.set()
         server.shutdown()

@@ -175,15 +175,34 @@ def convert(source: Path, destination: Path, mode: str,
     if cancel is not None:
         cancel.check()
     ready = ready_path(source, mode)
-    if destination.exists() and not (ready.exists() and os.path.samefile(ready, destination)):
-        raise RuntimeError(f'Output already exists; refusing to replace {destination.name}')
+    def published_ready():
+        return destination.exists() and ready.exists() and os.path.samefile(ready, destination)
+
+    def check_destination():
+        if destination.exists() and not (published_ready()
+                                         or (source.is_file() and os.path.samefile(source, destination))):
+            raise RuntimeError(f'Output already exists; refusing to replace {destination.name}')
+
+    check_destination()
     if not ready.exists():
         encode(source, ready, mode, progress, cancel=cancel)
     if cancel is not None:
         cancel.check()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        os.link(ready, destination)
+    check_destination()
+    if not published_ready():
+        if destination.exists():
+            # Only replace our original inode. Keep ready intact until the SQLite commit
+            # so a restart can prove publication even when source and output share a name.
+            with tempfile.TemporaryDirectory(prefix='.pullarr-publish-', dir=destination.parent) as work:
+                replacement = Path(work) / 'video.mkv'
+                os.link(ready, replacement)
+                if cancel is not None:
+                    cancel.check()
+                check_destination()
+                os.replace(replacement, destination)
+        else:
+            os.link(ready, destination)
     artwork = source.with_suffix('.jpg')
     if artwork.is_file():
         try:

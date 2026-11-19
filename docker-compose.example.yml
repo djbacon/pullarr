@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: 0.17.2
+        APP_VERSION: 0.18.0
     container_name: pullarr
     restart: unless-stopped
     ports:
@@ -25,7 +25,8 @@ services:
       # Leftover staging files are cleaned automatically after the entire queue empties.
       # Queue shows live download and conversion percentages automatically.
       # The trash button beside active progress cancels that job and ignores the video.
-      # One conversion can overlap the next download; no extra configuration.
+      # Sequential downloads continue independently of the single conversion worker.
+      # Finished downloads appear in their final folders; conversion replaces them on success.
       # Conversion automatically uses the lowest CPU priority and idle disk I/O priority.
       # Channels and Downloads menu counts update automatically; no extra configuration.
       # Configure Plex notifications in Settings; use a reachable server URL.

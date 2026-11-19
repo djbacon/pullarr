@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.18.0
+
+- Keep downloading videos sequentially while one independent encoder processes completed downloads in order. Downloads and polling no longer wait for the conversion backlog.
+- Publish each downloaded original and its artwork in the destination folder immediately, then atomically replace that original after conversion passes validation. Different source containers are removed only after successful conversion; unrelated existing files are preserved.
+- Retain staging hard links and durable job records for retries and restart recovery without downloading again. Each worker owns its SQLite connection; cancellation, per-job settings, and idle cleanup preserve pending sources. No database migration or new configuration is required.
+
 ## v0.17.2
 
 - Fix invisible cancel icons by drawing the trash icon as inline SVG instead of a CSS image mask blocked by the Content Security Policy. Preserve button sizing, keyboard controls, and confirmation behavior.
