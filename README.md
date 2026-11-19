@@ -1,6 +1,8 @@
-# Pullarr v0.16.1
+# Pullarr v0.16.2
 
 Lightweight YouTube RSS auto-downloader with a built-in web interface. No YAML configuration file is needed.
+
+Livestreams are always skipped, including scheduled streams and archived recordings. This also applies to manually queued videos and existing retries. yt-dlp checks livestream metadata before downloading media or thumbnails, without an extra lookup. Skipped IDs are remembered across polls and restarts and hidden from the download queue. Ordinary lookup/download failures still retry. Existing downloads and saved conversion jobs are preserved. No new setting or database migration is required. If the latest upload is a livestream, **Latest and future** skips it without selecting an older replacement.
 
 ## Interface
 

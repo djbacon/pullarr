@@ -21,14 +21,33 @@ with YoutubeDL(request['options']) as ydl:
     info = ydl.extract_info(request['url'], download=False)
     print(json.dumps(ydl.sanitize_info(info)))
 """
+_DOWNLOAD = """
+import sys
+from yt_dlp import YoutubeDL, parse_options
+
+def skip_live(info, *, incomplete=False):
+    if (info.get('is_live') or info.get('was_live')
+            or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live', 'was_live')):
+        print('pullarr-skip:live', flush=True)
+        return 'Pullarr skips livestreams'
+    return None
+
+options = parse_options()
+options.ydl_opts['match_filter'] = skip_live
+with YoutubeDL(options.ydl_opts) as ydl:
+    if options.options.load_info_filename is not None:
+        sys.exit(ydl.download_with_info_file(options.options.load_info_filename))
+    sys.exit(ydl.download(options.urls))
+"""
 
 
 @contextmanager
-def command(metadata=False):
+def command(metadata=False, skip_live=False):
     # This strong reference retains the old directory until the subprocess exits.
     with _LOCK:
         generation = _CURRENT
-    code = _METADATA if metadata else "import runpy; runpy.run_module('yt_dlp', run_name='__main__')"
+    code = _METADATA if metadata else (_DOWNLOAD if skip_live else
+                                      "import runpy; runpy.run_module('yt_dlp', run_name='__main__')")
     yield [sys.executable, '-c', _BOOTSTRAP + code, generation.name if generation else '']
 
 

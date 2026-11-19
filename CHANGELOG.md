@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.16.2
+
+- Always skip active, scheduled, processing, and archived livestreams before downloading media or thumbnails, including manually queued videos and existing retries. yt-dlp checks its extraction metadata without a separate network lookup.
+- Persist skipped IDs across polls and restarts; keep genuine download failures retryable and preserve existing downloads and interrupted conversion recovery. No schema migration or new configuration is required.
+
 ## v0.16.1
 
 - Keep section URLs clean during automatic version refreshes; remove legacy `v` and `_refresh` parameters without reloading, preserving the section and unrelated query parameters.

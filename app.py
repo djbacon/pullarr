@@ -32,7 +32,7 @@ import ytdlp_runtime
 import video_encoding
 
 
-VERSION = "0.16.1"
+VERSION = "0.16.2"
 USER_AGENT = f"pullarr/{VERSION}"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -706,10 +706,15 @@ def remove_download(conn: sqlite3.Connection, video_id: str) -> bool:
     return True
 
 
+class SkippedLivestream(Exception):
+    """yt-dlp rejected confirmed livestream metadata before downloading media."""
+
+
 def stream_download(cmd: list[str]) -> str | None:
     """Consume machine-readable progress as it arrives, retaining bounded diagnostics."""
     output = deque(maxlen=40)
     file_path = None
+    skipped_live = False
     with subprocess.Popen(cmd, text=True, encoding="utf-8", errors="replace",
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1) as process:
         for line in process.stdout:
@@ -717,6 +722,8 @@ def stream_download(cmd: list[str]) -> str | None:
             progress = re.fullmatch(r"pullarr-progress:\s*(\d+(?:\.\d+)?)%", line)
             if progress:
                 DOWNLOAD_PROGRESS.update(float(progress.group(1)))
+            elif line == "pullarr-skip:live":
+                skipped_live = True
             elif line.startswith("pullarr-file:"):
                 try:
                     candidate = json.loads(line.removeprefix("pullarr-file:"))
@@ -728,6 +735,8 @@ def stream_download(cmd: list[str]) -> str | None:
                 output.append(line[-4000:])
         if process.wait():
             raise subprocess.CalledProcessError(process.returncode, cmd, output="\n".join(output)[-4000:])
+    if skipped_live:
+        raise SkippedLivestream()
     return file_path
 
 
@@ -928,7 +937,7 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
                         logging.info("Skipped Short %s - %s", entry.channel_title, entry.video_id)
                         return False
             download_root.mkdir(parents=True, exist_ok=True)
-            with ytdlp_runtime.command() as executable:
+            with ytdlp_runtime.command(skip_live=True) as executable:
                 file_path = stream_download(executable + cmd)
             if not file_path or not Path(file_path).is_file():
                 raise RuntimeError("yt-dlp did not produce a confirmed output file")
@@ -950,6 +959,12 @@ def download_video(config: AppConfig, conn: sqlite3.Connection, entry: VideoEntr
             file_path = str(convert_download(job))
         complete_download(conn, job, file_path)
         return True
+    except SkippedLivestream:
+        with conn:
+            conn.execute("UPDATE videos SET status='skipped_live',last_error=NULL,updated_at=? "
+                         "WHERE video_id=? AND status IN ('pending','failed')", (utc_now(), entry.video_id))
+        logging.info("Skipped livestream %s - %s", entry.channel_title, entry.video_id)
+        return False
     except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
         fail_download(conn, entry, exc)
         return False
